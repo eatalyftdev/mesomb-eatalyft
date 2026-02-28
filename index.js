@@ -28,11 +28,12 @@ const handlePayment = async (req, res, serviceType) => {
   try {
     const { phone, amount, operator, userId, referenceId } = req.body;
 
-    if (!referenceId) {
-      return res.status(400).json({ error: "Missing referenceId" });
-    }
+    // ✅ Always generate unique reference & nonce
+    const transactionRef = referenceId
+      ? `${referenceId}-${Date.now()}-${uuidv4()}` // append unique suffix
+      : `EATALYFT-${serviceType}-${Date.now()}-${uuidv4()}`;
 
-    const transactionRef = referenceId;
+    const nonce = uuidv4();
 
     const response = await mesomb.makeCollect({
       payer: phone,
@@ -59,7 +60,11 @@ const handlePayment = async (req, res, serviceType) => {
         country: "CM",
       },
       reference: transactionRef,
+      nonce: nonce, // 🔑 unique per transaction
     });
+
+    // Optional: store transaction in DB here for idempotency check
+    // await Payment.create({ userId, transactionRef, amount, status: "pending" });
 
     return res.json({
       success: response.isOperationSuccess(),
@@ -112,7 +117,6 @@ app.post("/api/pay/wallet", (req, res) =>
 app.post("/api/refund", async (req, res) => {
   try {
     const { transactionId } = req.body;
-
     const result = await mesomb.refund(transactionId);
 
     return res.json({
@@ -136,14 +140,12 @@ app.post("/api/webhook", async (req, res) => {
     console.log("Webhook Received:", payload);
 
     if (payload.status === "SUCCESS") {
-
       const reference = payload.reference;
 
-      // 🔥 Here update Firestore:
+      // 🔥 Update Firestore or DB:
       // - Mark ride/food/parcel paid
       // - If wallet → increase balance
       // - Log transaction
-
       console.log("Payment Successful:", reference);
     }
 
@@ -162,9 +164,7 @@ app.post("/api/webhook", async (req, res) => {
 app.get("/api/transaction/:id", async (req, res) => {
   try {
     const id = req.params.id;
-
     const result = await mesomb.getTransactions([id]);
-
     return res.json(result);
 
   } catch (error) {
