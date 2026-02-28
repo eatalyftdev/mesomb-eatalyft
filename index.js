@@ -28,7 +28,11 @@ const handlePayment = async (req, res, serviceType) => {
   try {
     const { phone, amount, operator, userId, referenceId } = req.body;
 
-    const transactionRef = uuidv4();
+    if (!referenceId) {
+      return res.status(400).json({ error: "Missing referenceId" });
+    }
+
+    const transactionRef = referenceId;
 
     const response = await mesomb.makeCollect({
       payer: phone,
