@@ -14,9 +14,7 @@ app.use(express.json());
 app.use("/api/payments", paymentRoutes);
 app.use("/webhooks", webhookRoutes);
 
-app.get("/", (req, res) => {
-  res.send("Mesomb Payment Microservice Running 🚀");
-});
+app.get("/", (req, res) => res.send("Mesomb Payment Microservice Running 🚀"));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
