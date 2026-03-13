@@ -6,42 +6,40 @@ const router = express.Router();
 router.post("/mesomb", async (req, res) => {
   try {
     const payload = req.body;
+    console.log("Webhook Received:", payload);
 
-    // ⚠️ Always respond fast
+    // 🔔 Respond fast
     res.status(200).send("OK");
 
-    const trxID = payload.trxID;
+    const transactionRefId = payload.reference; // unify with reference from payment
+    if (!transactionRefId) {
+      console.error("Webhook missing reference");
+      return;
+    }
 
-    const transactionRef = db.collection("transactions").doc(trxID);
+    const transactionRef = db.collection("transactions").doc(transactionRefId);
     const doc = await transactionRef.get();
-
     if (!doc.exists) return;
 
     const transaction = doc.data();
-
-    // Prevent duplicate processing
-    if (transaction.status === "SUCCESS") return;
+    if (transaction.status === "SUCCESS") return; // prevent double-processing
 
     if (payload.status === "SUCCESS") {
-
       await db.runTransaction(async (t) => {
         const userRef = db.collection("users").doc(transaction.userId);
-
         const userDoc = await t.get(userRef);
         const currentBalance = userDoc.data()?.balance || 0;
 
-        t.update(userRef, {
-          balance: currentBalance + transaction.amount
-        });
+        // update balance for wallet payments, mark others as paid
+        let updates = { status: "SUCCESS", updatedAt: new Date(), webhookPayload: payload };
+        if (transaction.type === "Wallet") {
+          t.update(userRef, { balance: currentBalance + transaction.amount });
+        }
 
-        t.update(transactionRef, {
-          status: "SUCCESS",
-          updatedAt: new Date(),
-          webhookPayload: payload
-        });
+        t.update(transactionRef, updates);
+        console.log(`Transaction ${transactionRefId} updated successfully`);
       });
     }
-
   } catch (err) {
     console.error("Webhook error:", err);
   }
