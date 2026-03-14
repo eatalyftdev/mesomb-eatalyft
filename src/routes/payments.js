@@ -40,7 +40,7 @@ router.post("/collect", async (req, res) => {
     const customer = {
       firstName: "EataLyft",
       lastName: type,
-      email: "support@eatalyft.com",
+      email: "eatapay@eatalyft.com",
     };
 
     const location = {

@@ -43,7 +43,7 @@ const handlePayment = async (req, res, serviceType) => {
       customer: {
         firstName: "EataLyft",
         lastName: serviceType,
-        email: "support@eatalyft.com",
+        email: "eatapay@eatalyft.com",
       },
       products: [
         {
