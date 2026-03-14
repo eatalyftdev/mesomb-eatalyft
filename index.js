@@ -1,8 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { PaymentOperation } from "@hachther/mesomb";
-import { v4 as uuidv4 } from "uuid";
+import { PaymentOperation, RandomGenerator } from "@hachther/mesomb";
 
 dotenv.config();
 
@@ -15,7 +14,7 @@ app.use(express.json());
 // ==============================
 
 const mesomb = new PaymentOperation({
-  applicationKey: process.env.MESOMB_APP_KEY,
+  applicationKey: process.env.MESOMB_APPLICATION_KEY,
   accessKey: process.env.MESOMB_ACCESS_KEY,
   secretKey: process.env.MESOMB_SECRET_KEY,
 });
@@ -30,10 +29,10 @@ const handlePayment = async (req, res, serviceType) => {
 
     // ✅ Always generate unique reference & nonce
     const transactionRef = referenceId
-      ? `${referenceId}-${Date.now()}-${uuidv4()}` // append unique suffix
-      : `EATALYFT-${serviceType}-${Date.now()}-${uuidv4()}`;
+      ? `${referenceId}-${Date.now()}-${RandomGenerator.nonce(8)}`
+      : `EATALYFT-${serviceType}-${Date.now()}-${RandomGenerator.nonce(8)}`;
 
-    const nonce = uuidv4();
+    const nonce = RandomGenerator.nonce();
 
     const response = await mesomb.makeCollect({
       payer: phone,
@@ -174,6 +173,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 
 // ==============================
 
-app.listen(process.env.PORT, () => {
-  console.log(`🚀 EataLyft Payment Engine Running on ${process.env.PORT}`);
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, "localhost", () => {
+  console.log(`EataLyft Payment Engine Running on port ${PORT}`);
 });

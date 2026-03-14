@@ -14,7 +14,21 @@ app.use(express.json());
 app.use("/api/payments", paymentRoutes);
 app.use("/webhooks", webhookRoutes);
 
-app.get("/", (req, res) => res.send("Mesomb Payment Microservice Running 🚀"));
+app.get("/", (req, res) => {
+  res.json({
+    service: "EataLyft Payment Microservice",
+    status: "running",
+    endpoints: {
+      collect:        "POST /api/payments/collect",
+      deposit:        "POST /api/payments/deposit",
+      refund:         "POST /api/payments/refund",
+      transactions:   "GET  /api/payments/transactions?ids=id1,id2&source=MESOMB",
+      checkTrx:       "GET  /api/payments/transactions/check?ids=id1,id2&source=MESOMB",
+      appStatus:      "GET  /api/payments/status",
+      webhook:        "POST /webhooks/mesomb",
+    },
+  });
+});
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, "localhost", () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, "localhost", () => console.log(`EataLyft Payment Engine running on port ${PORT}`));
