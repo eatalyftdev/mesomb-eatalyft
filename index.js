@@ -173,7 +173,12 @@ app.get("/api/transaction/:id", async (req, res) => {
 
 // ==============================
 
+// ==============================
+// 🚀 START SERVER
+// ==============================
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, "localhost", () => {
-  console.log(`EataLyft Payment Engine Running on port ${PORT}`);
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 EataLyft Payment Engine Running on port ${PORT}`);
 });
