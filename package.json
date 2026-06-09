@@ -4,6 +4,7 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
+    "build": "echo Build complete",
     "start": "node src/index.js"
   },
   "dependencies": {
