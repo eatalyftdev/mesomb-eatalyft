@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "f2P6-e51bY0kXx2GR7_4N"
+uri = "file://EATALYFT_APP_INTEGRATION_PROMPT.md"
+type = "text"
+title = "EataLyft App Integration Prompt"
