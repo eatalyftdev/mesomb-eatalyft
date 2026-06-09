@@ -1,0 +1,6 @@
+{
+  "name": "mesomb-payment-service",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-09",
+  "compatibility_flags": ["nodejs_compat"]
+}
