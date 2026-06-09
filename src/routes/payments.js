@@ -15,18 +15,22 @@ const router = express.Router();
  * POST /api/payments/collect
  *
  * Collect money from a customer's mobile money account.
+ * Uses asynchronous mode by default — the final status arrives via webhook.
+ * An initial PENDING record is saved to Supabase immediately.
  *
  * Body:
  *   phone       {string}  - Customer phone number (e.g. '677000000')
  *   amount      {number}  - Amount in XAF
  *   service     {string}  - 'MTN' | 'ORANGE' | 'AIRTEL'
- *   type        {string}  - Payment type label: 'Ride' | 'Food' | 'Parcel' | 'Wallet'
- *   userId      {string}  - (optional) Your user ID for Firestore logging
- *   mode        {string}  - (optional) 'synchronous' | 'asynchronous' (default: synchronous)
+ *   type        {string}  - 'Ride' | 'Food' | 'Parcel' | 'Wallet' (used as reference prefix)
+ *   userId      {string}  - (optional) Your internal user ID
+ *   trxID       {string}  - (optional) Your order/booking ID — if omitted, auto-generated
+ *   mode        {string}  - (optional) 'asynchronous' (default) | 'synchronous'
+ *   customer    {object}  - (optional) { firstName, lastName, email, town, region, country }
  */
 router.post("/collect", async (req, res) => {
   try {
-    const { phone, amount, service, type, userId, mode } = req.body;
+    const { phone, amount, service, type, userId, trxID: bodyTrxID, mode, customer } = req.body;
 
     if (!phone || !amount || !service || !type) {
       return res.status(400).json({
@@ -35,63 +39,43 @@ router.post("/collect", async (req, res) => {
       });
     }
 
-    const trxID = `EATALYFT-${type.toUpperCase()}-${Date.now()}`;
+    // trxID becomes the `reference` in all MeSomb webhook events — use your order ID here
+    const trxID = bodyTrxID || `EATALYFT-${type.toUpperCase()}-${Date.now()}`;
 
-    const customer = {
-      firstName: "EataLyft",
-      lastName: type,
-      email: "eatapay@eatalyft.com",
-    };
-
-    const location = {
-      town: "Bamenda",
-      region: "North-West",
-      country: "CM",
-    };
-
-    const products = [
-      {
-        name: `${type} Payment`,
-        category: type,
-        quantity: 1,
-        amount,
-      },
-    ];
-
-    const response = await collectPayment({
+    const { response, paymentId, opSuccess, txnSuccess } = await collectPayment({
       phone,
       amount,
       service,
+      type,
       trxID,
-      customer,
-      location,
-      products,
-      mode: mode || "synchronous",
+      userId,
+      mode: mode || "asynchronous",
+      customer: customer || undefined,
     });
 
-    const result = {
-      success: response.isOperationSuccess(),
-      transactionSuccess: response.isTransactionSuccess(),
-      trxID,
-      status: response.transaction?.status,
-      transactionId: response.transaction?.pk,
-    };
-
+    // Optionally log to Firestore as well (for apps still using Firebase)
     if (db) {
       await db.collection("transactions").doc(trxID).set({
-        userId: userId || null,
+        userId:             userId || null,
         phone,
         amount,
         type,
         service,
-        status: response.transaction?.status || "PENDING",
+        status:             response.transaction?.status || "PENDING",
         trxID,
-        mesombTransactionId: response.transaction?.pk || null,
-        createdAt: new Date(),
+        mesombTransactionId: response.transaction?.pk   || null,
+        createdAt:          new Date(),
       });
     }
 
-    return res.json(result);
+    return res.json({
+      success:            opSuccess,
+      transactionSuccess: txnSuccess,
+      trxID,
+      paymentId,
+      status:             response.transaction?.status || "PENDING",
+      transactionId:      response.transaction?.pk    || null,
+    });
   } catch (error) {
     console.error("Collect payment error:", error);
     return res.status(500).json({ success: false, error: error.message });
@@ -102,16 +86,18 @@ router.post("/collect", async (req, res) => {
  * POST /api/payments/deposit
  *
  * Deposit (disburse) money into a customer's mobile money account (payout).
+ * An initial PENDING record is saved to Supabase immediately.
  *
  * Body:
  *   phone    {string}  - Recipient phone number
  *   amount   {number}  - Amount in XAF
  *   service  {string}  - 'MTN' | 'ORANGE' | 'AIRTEL'
- *   userId   {string}  - (optional) Your user ID
+ *   userId   {string}  - (optional) Your internal user ID
+ *   trxID    {string}  - (optional) Your payout reference ID
  */
 router.post("/deposit", async (req, res) => {
   try {
-    const { phone, amount, service, userId } = req.body;
+    const { phone, amount, service, userId, trxID: bodyTrxID } = req.body;
 
     if (!phone || !amount || !service) {
       return res.status(400).json({
@@ -120,33 +106,38 @@ router.post("/deposit", async (req, res) => {
       });
     }
 
-    const trxID = `EATALYFT-DEPOSIT-${Date.now()}`;
+    const trxID = bodyTrxID || `EATALYFT-DEPOSIT-${Date.now()}`;
 
-    const response = await depositPayment({ phone, amount, service, trxID });
-
-    const result = {
-      success: response.isOperationSuccess(),
-      transactionSuccess: response.isTransactionSuccess(),
+    const { response, paymentId, opSuccess, txnSuccess } = await depositPayment({
+      phone,
+      amount,
+      service,
       trxID,
-      status: response.transaction?.status,
-      transactionId: response.transaction?.pk,
-    };
+      userId,
+    });
 
     if (db) {
       await db.collection("transactions").doc(trxID).set({
-        userId: userId || null,
+        userId:             userId || null,
         phone,
         amount,
-        type: "Deposit",
+        type:               "Deposit",
         service,
-        status: response.transaction?.status || "PENDING",
+        status:             response.transaction?.status || "PENDING",
         trxID,
-        mesombTransactionId: response.transaction?.pk || null,
-        createdAt: new Date(),
+        mesombTransactionId: response.transaction?.pk   || null,
+        createdAt:          new Date(),
       });
     }
 
-    return res.json(result);
+    return res.json({
+      success:            opSuccess,
+      transactionSuccess: txnSuccess,
+      trxID,
+      paymentId,
+      status:             response.transaction?.status || "PENDING",
+      transactionId:      response.transaction?.pk    || null,
+    });
   } catch (error) {
     console.error("Deposit payment error:", error);
     return res.status(500).json({ success: false, error: error.message });
@@ -159,7 +150,7 @@ router.post("/deposit", async (req, res) => {
  * Refund a transaction.
  *
  * Body:
- *   transactionId  {string}  - The MeSomb transaction ID to refund
+ *   transactionId  {string}  - The MeSomb transaction pk to refund
  *   amount         {number}  - (optional) Partial refund amount; omit for full refund
  */
 router.post("/refund", async (req, res) => {
@@ -176,10 +167,10 @@ router.post("/refund", async (req, res) => {
     const response = await refundTransaction(transactionId, amount);
 
     return res.json({
-      success: response.isOperationSuccess(),
+      success:            response.isOperationSuccess(),
       transactionSuccess: response.isTransactionSuccess(),
-      status: response.transaction?.status,
-      transactionId: response.transaction?.pk,
+      status:             response.transaction?.status,
+      transactionId:      response.transaction?.pk,
     });
   } catch (error) {
     console.error("Refund error:", error);
@@ -207,7 +198,7 @@ router.get("/transactions", async (req, res) => {
       });
     }
 
-    const idList = ids.split(",").map((id) => id.trim()).filter(Boolean);
+    const idList       = ids.split(",").map((id) => id.trim()).filter(Boolean);
     const transactions = await getTransactions(idList, source || "MESOMB");
 
     return res.json({ success: true, transactions });
@@ -233,7 +224,7 @@ router.get("/transactions/check", async (req, res) => {
       });
     }
 
-    const idList = ids.split(",").map((id) => id.trim()).filter(Boolean);
+    const idList       = ids.split(",").map((id) => id.trim()).filter(Boolean);
     const transactions = await checkTransactions(idList, source || "MESOMB");
 
     return res.json({ success: true, transactions });

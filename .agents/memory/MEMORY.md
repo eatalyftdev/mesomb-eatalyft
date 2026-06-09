@@ -1,0 +1,4 @@
+- [Webhook raw body](webhook-raw-body.md) — webhook route MUST be mounted before express.json(); uses express.raw() for HMAC sig verification
+- [MeSomb env var name](mesomb-env-vars.md) — correct name is MESOMB_APPLICATION_KEY (not MESOMB_APP_KEY); all three keys required
+- [Async collect mode](async-collect.md) — production collect uses asynchronous mode; final status comes via webhook, not API response
+- [trxID reconciliation](trxid-reconciliation.md) — trxID passed to makeCollect becomes reference field in webhook payload; must be internal order ID

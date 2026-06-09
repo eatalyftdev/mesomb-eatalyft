@@ -1,0 +1,331 @@
+# CONTEXT — READ BEFORE WRITING ANY CODE
+
+You are working on the Eatalyft payment microservice: a Node.js/TypeScript service that wraps the MeSomb payment API for a multi-vertical super-app in Cameroon. The repo is at https://github.com/eatalyftdev/mesomb-eatalyft.git. Auth is Firebase (session cookies), data layer is Supabase (service role key, no RLS bypass). Payments run over MTN Mobile Money and Orange Money in XAF.
+
+The goal of this task is to completely harden the webhook handling, ensure all transaction states (SUCCESS, FAILED, PENDING, REFUNDED) are correctly stored and propagated to the main Eatalyft app, and fix any gaps based on the MeSomb API docs (version 2026-05-01).
+
+---
+
+# SKILLS TO ACTIVATE
+
+Before writing any code, activate these jeffallan/claude-skills personas:
+
+1. **Security Skill** — for HMAC-SHA256 signature verification and replay-attack protection
+2. **Backend Skill** — for idempotent webhook handler architecture (queue-first pattern)
+3. **API/Architecture Skill** — for event routing logic and MeSomb API contract alignment
+4. **Data/ML Skill** — for Supabase schema and upsert strategy
+
+---
+
+# TASK 1 — AUDIT THE EXISTING CODEBASE
+
+Read all files in the repo. Specifically look for:
+- The webhook handler route (likely `/webhooks/mesomb` or similar)
+- How the `X-MeSomb-Webhook-Signature` header is (or is not) verified
+- How transaction status (`SUCCESS`, `FAILED`, `PENDING`, `REFUNDED`) is handled
+- Whether idempotency (deduplication by event ID) is implemented
+- Whether `payment.transaction.failed` events trigger any logic
+- Whether `checkout.session.*` events are handled
+- Whether the Supabase `payments` or `transactions` table has the correct schema
+- Any `.env` or config file that references `MESOMB_WEBHOOK_SECRET`
+
+Report all findings before making changes.
+
+---
+
+# TASK 2 — IMPLEMENT FULL WEBHOOK SIGNATURE VERIFICATION
+
+Implement a `verifyMeSombWebhook` utility at `src/lib/mesomb-webhook.ts` with this exact logic (from the official MeSomb docs):
+
+```typescript
+import crypto from 'crypto';
+
+export interface VerifyWebhookOptions {
+  rawBody: string;
+  signatureHeader: string;
+  webhookSecret: string;
+  toleranceSeconds?: number; // default 300 (5 minutes)
+}
+
+export function verifyMeSombWebhook(opts: VerifyWebhookOptions): void {
+  // 1. Check header present
+  // 2. Split "t=<ts>,v1=<sig>" format
+  // 3. Validate timestamp is a finite number
+  // 4. Check timestamp age against toleranceSeconds — reject if too old (replay attack protection)
+  // 5. Build signed payload as: `${timestamp}.${rawBody}`
+  // 6. Compute HMAC-SHA256(webhookSecret, signedPayload).digest('hex')
+  // 7. Use crypto.timingSafeEqual for comparison — NEVER use === string comparison
+  // 8. Throw descriptive errors on any failure so the caller can return 400
+}
+```
+
+Also export a `MeSombWebhookEvent` TypeScript type that covers the full event structure:
+
+```typescript
+export interface MeSombWebhookEvent {
+  id: string;               // use for deduplication
+  object_type: string;
+  event_type: MeSombEventType;
+  api_version: string;
+  created_at: string;
+  livemode: boolean;
+  data: {
+    object: MeSombTransactionObject | MeSombCheckoutSessionObject | MeSombDisputeObject;
+    previous_attributes?: Record<string, unknown>;
+  };
+}
+
+export type MeSombEventType =
+  // Payment transaction
+  | 'payment.transaction.success'
+  | 'payment.transaction.failed'
+  // Checkout session
+  | 'checkout.session.completed'
+  | 'checkout.session.expired'
+  | 'checkout.session.canceled'
+  | 'checkout.session.created'
+  // Secure payment
+  | 'securepay.transaction.created'
+  | 'securepay.transaction.cancelled'
+  | 'securepay.transaction.expired'
+  | 'securepay.transaction.funded'
+  | 'securepay.transaction.awaiting_release'
+  | 'securepay.transaction.released'
+  | 'securepay.transaction.refunded'
+  | 'securepay.transaction.disputed'
+  | 'securepay.transaction.fulfillment_updated'
+  // Disputes
+  | 'securepay.dispute.evidence_added'
+  | 'securepay.dispute.message_added'
+  | 'securepay.dispute.under_review'
+  | 'securepay.dispute.resolved';
+
+export type MeSombTransactionStatus = 'SUCCESS' | 'FAILED' | 'PENDING' | 'REFUNDED';
+
+export interface MeSombTransactionObject {
+  pk: string;
+  status: MeSombTransactionStatus;
+  type: 'COLLECT' | 'REFILL' | 'PAYMENT' | 'DEPOSIT';
+  amount: number;
+  fees: number;
+  trxamount: number;
+  b_party: string | null;
+  message: string | null;
+  service: 'MTN' | 'ORANGE' | 'AIRTEL' | string;
+  reference: string | null; // your trxID
+  ts: string;
+  direction: -1 | 1;
+  country: string;
+  currency: string;
+  fin_trx_id: string | null; // operator transaction ID
+  name: string | null;
+  customer?: {
+    id: number;
+    email: string | null;
+    phone: string | null;
+    first_name: string | null;
+    last_name: string | null;
+    town: string | null;
+    region: string | null;
+    country: string | null;
+    address1: string | null;
+    address2: string | null;
+  };
+  location?: {
+    town: string;
+    region: string | null;
+    country: string | null;
+  };
+  products?: Array<{
+    id: string;
+    name: string;
+    category: string;
+    quantity: number;
+    amount: string;
+  }>;
+}
+```
+
+---
+
+# TASK 3 — REBUILD THE WEBHOOK HANDLER
+
+Rewrite the webhook handler at `src/routes/webhook.ts` (or wherever it currently lives). The handler must follow the **recommended processing model from the MeSomb docs**:
+
+1. **Read raw body** (do NOT use `express.json()` middleware before this route — use `express.raw({ type: 'application/json' })` so the raw buffer is available for signature verification)
+2. **Read `X-MeSomb-Webhook-Signature` header**
+3. **Call `verifyMeSombWebhook`** — if it throws, return `400` immediately
+4. **Parse JSON** from the raw body
+5. **Check `X-MeSomb-Webhook-Event-Id` header OR `event.id` for deduplication** — query Supabase `webhook_events` table; if already processed, return `200` without re-processing
+6. **Enqueue or synchronously route** the event to the correct handler by `event_type`
+7. **Return `200 OK`** or `204 No Content` immediately — do NOT block on heavy processing
+8. **Process the event** (either inline for now, or via a Supabase queue table for async later)
+
+Route all event types to dedicated handlers:
+
+```typescript
+// Event routing map
+const handlers: Record<MeSombEventType, (event: MeSombWebhookEvent) => Promise<void>> = {
+  'payment.transaction.success': handlePaymentSuccess,
+  'payment.transaction.failed': handlePaymentFailed,
+  'checkout.session.completed': handleCheckoutCompleted,
+  'checkout.session.expired': handleCheckoutExpired,
+  'checkout.session.canceled': handleCheckoutCanceled,
+  'checkout.session.created': handleCheckoutCreated,
+  'securepay.transaction.funded': handleSecurePayFunded,
+  'securepay.transaction.released': handleSecurePayReleased,
+  'securepay.transaction.refunded': handleSecurePayRefunded,
+  'securepay.transaction.disputed': handleSecurePayDisputed,
+  // ... etc
+};
+```
+
+---
+
+# TASK 4 — IMPLEMENT ALL TRANSACTION STATUS HANDLERS
+
+Implement each handler. Each one must:
+
+### `handlePaymentSuccess(event)`
+- Extract `data.object` as `MeSombTransactionObject`
+- Upsert into Supabase `payments` table with `status: 'SUCCESS'`, `mesomb_pk`, `fin_trx_id`, `amount`, `fees`, `service`, `reference` (your internal trxID), `customer`, `ts`
+- Use `reference` field to locate the internal order/trip/booking in Supabase and update its `payment_status` to `'paid'`
+- For ride orders: update `rides` table; for food: update `orders` table; for parcel: update `parcel_orders` table; for bus bookings: update `bus_bookings`; for hotel: update `hotel_bookings` — use the `reference` prefix pattern (e.g. `RIDE-`, `FOOD-`, `PARCEL-`, `BUS-`, `HOTEL-`) to determine which table to update
+- Store `fin_trx_id` (operator transaction ID) for reconciliation
+
+### `handlePaymentFailed(event)`
+- Upsert into Supabase `payments` table with `status: 'FAILED'`
+- Update the linked order's `payment_status` to `'failed'`
+- Log the `message` field from the transaction for debugging
+- Do NOT throw — a failed payment is a valid business event, not an error
+
+### `handleCheckoutCompleted(event)`
+- Extract `data.object` as `MeSombCheckoutSessionObject`
+- Update checkout session record in Supabase
+- If `payment_status` on the session object is `paid`, trigger the same fulfillment logic as `handlePaymentSuccess`
+
+### `handleCheckoutExpired(event)` and `handleCheckoutCanceled(event)`
+- Mark checkout session as expired/canceled in Supabase
+- Release any reserved inventory or booking holds
+
+### `handleSecurePayFunded(event)`
+- Mark the linked order as `'funded'` — seller notified to prepare
+
+### `handleSecurePayReleased(event)`
+- Mark as `'completed'` — funds released to seller
+
+### `handleSecurePayRefunded(event)`
+- Mark as `'refunded'` — buyer returned funds
+
+---
+
+# TASK 5 — SUPABASE SCHEMA MIGRATIONS
+
+Generate SQL migrations (in `supabase/migrations/`) for any missing tables. Ensure these exist:
+
+```sql
+-- Webhook event deduplication table
+CREATE TABLE IF NOT EXISTS webhook_events (
+  id TEXT PRIMARY KEY,                    -- MeSomb event ID (X-MeSomb-Webhook-Event-Id)
+  event_type TEXT NOT NULL,
+  processed_at TIMESTAMPTZ DEFAULT NOW(),
+  payload JSONB                           -- full event payload for audit
+);
+
+-- Payments table (upsert target)
+CREATE TABLE IF NOT EXISTS payments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  mesomb_pk TEXT UNIQUE,                  -- transaction.pk from MeSomb
+  fin_trx_id TEXT,                        -- operator transaction ID
+  reference TEXT,                         -- your trxID (links to order)
+  status TEXT NOT NULL DEFAULT 'PENDING', -- SUCCESS | FAILED | PENDING | REFUNDED
+  amount NUMERIC NOT NULL,
+  fees NUMERIC DEFAULT 0,
+  trxamount NUMERIC,
+  service TEXT,                           -- MTN | ORANGE | AIRTEL
+  currency TEXT DEFAULT 'XAF',
+  country TEXT DEFAULT 'CM',
+  direction INTEGER,                      -- -1 debit, 1 credit
+  type TEXT,                              -- COLLECT | DEPOSIT | PAYMENT
+  b_party TEXT,
+  message TEXT,
+  customer_data JSONB,
+  location_data JSONB,
+  products JSONB,
+  livemode BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_reference ON payments(reference);
+CREATE INDEX IF NOT EXISTS idx_payments_mesomb_pk ON payments(mesomb_pk);
+CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+```
+
+Also add `payment_id UUID REFERENCES payments(id)` and `payment_status TEXT DEFAULT 'pending'` columns (if not present) to: `rides`, `orders`, `parcel_orders`, `bus_bookings`, `hotel_bookings`.
+
+---
+
+# TASK 6 — COLLECT / DEPOSIT API HARDENING
+
+Review the `makeCollect` and `makeDeposit` calls in the service layer. Ensure:
+
+1. **`nonce` is always set** — use `RandomGenerator.nonce()` from `@hachther/mesomb`
+2. **`trxID` is always set** — use your internal order ID so it becomes the `reference` field in webhook events, enabling reconciliation
+3. **`mode` is set to `'asynchronous'`** for all production collect calls (do not block on operator response — rely on webhook for final status)
+4. **`customer` object** is populated from the Firebase user profile
+5. **`location`** is set to `{ town: 'Bamenda', region: 'NW', country: 'CM' }` as default (or use the user's location if available)
+6. Check `response.isOperationSuccess()` and `response.isTransactionSuccess()` separately — log both; a successful operation may still have a failed transaction
+7. Save the initial `PENDING` payment record to Supabase immediately after the collect call, before the webhook arrives
+
+---
+
+# TASK 7 — ENVIRONMENT VARIABLES
+
+Ensure `README.md` and `.env.example` include these variables:
+MESOMB_APPLICATION_KEY=
+MESOMB_ACCESS_KEY=
+MESOMB_SECRET_KEY=
+MESOMB_WEBHOOK_SECRET=       # whsec_... from MeSomb dashboard
+MESOMB_API_VERSION=2026-05-01
+MESOMB_LIVEMODE=true          # false for test mode
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+FIREBASE_PROJECT_ID=
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS=300
+
+---
+
+# TASK 8 — TESTS
+
+Write unit tests in `src/__tests__/webhook.test.ts` covering:
+1. Valid signature verification passes
+2. Invalid signature throws
+3. Timestamp too old (>300s) throws
+4. Duplicate event ID returns 200 without re-processing
+5. `payment.transaction.success` handler upserts correct Supabase record
+6. `payment.transaction.failed` handler marks order as failed without crashing
+7. Unknown `event_type` is logged but does not crash the handler (return 200)
+
+---
+
+# TASK 9 — DEPLOYMENT NOTES
+
+Add a comment block at the top of the webhook handler file noting:
+- The webhook endpoint URL to configure in MeSomb dashboard: `https://<your-vercel-domain>/api/webhooks/mesomb`
+- The MeSomb retry window: 72 hours auto-retry, 90 days manual replay
+- That this endpoint must NOT use `express.json()` middleware (raw body required for signature)
+- That the endpoint must be publicly reachable over HTTPS (satisfied by Vercel)
+
+---
+
+# IMPORTANT RULES
+
+- Never use `===` to compare HMAC signatures — always use `crypto.timingSafeEqual`
+- Always use the **raw request body** (not re-serialized JSON) for signature verification
+- Always return `200` or `204` for events that are received but unrecognized — never `404` or `500` for unknown event types (that would trigger unnecessary MeSomb retries)
+- Failed transactions (`payment.transaction.failed`) are **normal business events** — handle them gracefully, do not treat as system errors
+- The `reference` field in the transaction payload is the `trxID` you passed during `makeCollect` — always pass your internal order/booking ID as `trxID` so you can look it up on webhook receipt
+- `isOperationSuccess()` and `isTransactionSuccess()` can differ — always check both and log accordingly
+
+When all tasks are complete, run `git add -A && git commit -m "feat: harden MeSomb webhook handling, idempotency, all event types, Supabase sync" && git push origin main`. and give a prommpt that will be pasted in the main eatalyft app to work with the mircoservice updates so payemtns webhooks are all a success 
