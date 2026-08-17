@@ -18,4 +18,4 @@ if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && proc
   console.warn("Firebase credentials not configured. Firestore will be unavailable.");
 }
 
-export { db };
+export { db, admin };

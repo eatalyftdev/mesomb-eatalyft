@@ -1,5 +1,22 @@
 /**
- * MeSomb Webhook Handler
+ * MeSomb Webhook Handler (Microservice Entry Point)
+ *
+ * ARCHITECTURE (Two-Webhook Design — v2.0.0):
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This microservice acts as a **lightweight gateway** to the main app's webhook
+ * handler. It is NOT the authoritative processor of payments.
+ *
+ * RESPONSIBILITY:
+ * 1. Verify X-MeSomb-Webhook-Signature (HMAC-SHA256, 5-min tolerance)
+ * 2. Check idempotency using Firestore mesomb_events collection
+ * 3. Forward raw body + signature headers to main app's /api/webhook/mesomb
+ * 4. Record event in Firestore ONLY after main app accepts
+ *
+ * The main app is the SINGLE SOURCE OF TRUTH for:
+ * • Wallet credits
+ * • Mission activation
+ * • Notifications (FCM, WhatsApp)
+ * • All business logic
  *
  * DEPLOYMENT NOTES:
  * ─────────────────────────────────────────────────────────────────────────────
@@ -16,16 +33,15 @@
  *
  * • The endpoint must be publicly reachable over HTTPS.
  *
- * • Dual-write strategy: every payment record is written to BOTH Supabase and
- *   Firestore. Supabase is primary; Firestore is the fallback mirror. The
- *   Firestore write always runs regardless of whether Supabase succeeded.
+ * • Set environment variables:
+ *   - MESOMB_WEBHOOK_SECRET: webhook signing secret from MeSomb dashboard
+ *   - EATALYFT_MAIN_APP_URL: main app URL (e.g., https://eatalyft.cm or http://localhost:3000)
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import express from "express";
-import { verifyMeSombWebhook, MeSombEventTypes, resolveOrderTable } from "../lib/mesombWebhook.js";
-import { supabase } from "../config/supabase.js";
-import { db } from "../config/firebase.js";
+import { createHmac, timingSafeEqual } from "crypto";
+import { db, admin } from "../config/firebase.js";
 
 const router = express.Router();
 
@@ -34,550 +50,367 @@ const router = express.Router();
 router.use(express.raw({ type: "*/*" }));
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SHARED HELPERS
+// SIGNATURE VERIFICATION & IDEMPOTENCY
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Build the canonical payments row from a MeSomb transaction object.
- * Used for Supabase upserts (snake_case keys).
+ * Verify MeSomb webhook signature using HMAC-SHA256
+ * Spec: https://docs.mesomb.com/development/webhooks
  *
- * @param {object} txn - data.object from a MeSomb event
- * @param {boolean} livemode
- * @returns {object}
+ * @param {object} options
+ * @param {Buffer} options.rawBody - raw request body
+ * @param {string} options.signatureHeader - X-MeSomb-Webhook-Signature header value
+ * @param {string} options.secret - MESOMB_WEBHOOK_SECRET
+ * @param {number} [options.toleranceSeconds=300] - max age in seconds (5 min default)
+ * @returns {object} { ok: boolean, reason: string }
  */
-function buildPaymentRow(txn, livemode = true) {
-  return {
-    mesomb_pk:     txn.pk            || null,
-    fin_trx_id:    txn.fin_trx_id   || null,
-    reference:     txn.reference    || null,
-    status:        txn.status,
-    amount:        txn.amount,
-    fees:          txn.fees         ?? 0,
-    trxamount:     txn.trxamount    || null,
-    service:       txn.service      || null,
-    currency:      txn.currency     || "XAF",
-    country:       txn.country      || "CM",
-    direction:     txn.direction    ?? null,
-    type:          txn.type         || null,
-    b_party:       txn.b_party      || null,
-    message:       txn.message      || null,
-    customer_data: txn.customer     || null,
-    location_data: txn.location     || null,
-    products:      txn.products     || null,
-    livemode,
-    updated_at:    new Date().toISOString(),
-  };
+function verifyMeSombSignature({ rawBody, signatureHeader, secret, toleranceSeconds = 300 }) {
+  if (!signatureHeader) {
+    return { ok: false, reason: "Missing X-MeSomb-Webhook-Signature header" };
+  }
+
+  if (!secret) {
+    return { ok: false, reason: "MESOMB_WEBHOOK_SECRET not configured" };
+  }
+
+  if (!rawBody || rawBody.length === 0) {
+    return { ok: false, reason: "Empty request body" };
+  }
+
+  // Parse signature header: t=<timestamp>,v1=<signature>
+  const parts = signatureHeader.split(",").map((p) => p.trim());
+  const tPart = parts.find((p) => p.startsWith("t="));
+  const vPart = parts.find((p) => p.startsWith("v1="));
+
+  if (!tPart || !vPart) {
+    return { ok: false, reason: "Malformed signature header (expected t=<ts>,v1=<sig>)" };
+  }
+
+  const timestamp = Number(tPart.slice(2));
+  const signature = vPart.slice(3);
+
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return { ok: false, reason: "Invalid timestamp in signature header" };
+  }
+
+  // Replay protection: check timestamp is within tolerance window
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > toleranceSeconds) {
+    return {
+      ok: false,
+      reason: `Signature timestamp outside ${toleranceSeconds}s tolerance (replay attempt?)`,
+    };
+  }
+
+  // HMAC-SHA256 verification
+  const bodyStr = rawBody.toString("utf8");
+  const signedPayload = `${timestamp}.${bodyStr}`;
+  const expected = createHmac("sha256", secret)
+    .update(signedPayload, "utf8")
+    .digest("hex");
+
+  const expectedBuf = Buffer.from(expected, "hex");
+  const signatureBuf = Buffer.from(signature, "hex");
+
+  // Timing-safe comparison
+  if (
+    expectedBuf.length !== signatureBuf.length ||
+    !timingSafeEqual(expectedBuf, signatureBuf)
+  ) {
+    return { ok: false, reason: "Signature mismatch" };
+  }
+
+  return { ok: true, reason: "Valid" };
 }
 
-/**
- * Mirror a payment record to Firestore `payments` collection.
- *
- * Called after every Supabase write — regardless of whether Supabase succeeded.
- * Firestore is the fallback; if Supabase is down this ensures data is not lost.
- *
- * Document ID = reference (trxID) when present, else mesomb_pk.
- * Fields are camelCase (JS convention) matching the Firestore data model.
- *
- * @param {object} row       - Supabase-format payment row from buildPaymentRow()
- * @param {object} [extra]   - Any extra fields to merge (e.g. supabaseId, walletCredited)
- */
-async function mirrorPaymentToFirestore(row, extra = {}) {
-  if (!db) return;
-
-  const docId = row.reference || row.mesomb_pk;
-  if (!docId) {
-    console.warn("mirrorPaymentToFirestore: no reference or mesomb_pk — skipping");
-    return;
-  }
-
-  const doc = {
-    // Core identity
-    mesombPk:      row.mesomb_pk     || null,
-    finTrxId:      row.fin_trx_id   || null,
-    reference:     row.reference    || null,
-    // Status & amounts
-    status:        row.status,
-    amount:        row.amount,
-    fees:          row.fees          ?? 0,
-    trxAmount:     row.trxamount    || null,
-    // Network
-    service:       row.service      || null,
-    currency:      row.currency     || "XAF",
-    country:       row.country      || "CM",
-    direction:     row.direction    ?? null,
-    type:          row.type         || null,
-    bParty:        row.b_party      || null,
-    message:       row.message      || null,
-    // Rich objects
-    customer:      row.customer_data || null,
-    location:      row.location_data || null,
-    products:      row.products      || null,
-    // Meta
-    livemode:      row.livemode      ?? true,
-    updatedAt:     new Date(),
-    source:        "mesomb-webhook",
-    ...extra,
-  };
-
-  try {
-    await db.collection("payments").doc(docId).set(doc, { merge: true });
-    console.log(`Firestore payments/${docId} mirrored (status=${row.status})`);
-  } catch (err) {
-    console.error(`Firestore mirror failed for payments/${docId}:`, err.message);
-  }
-}
+// In-memory dedupe cache (first line of defense; Firestore is source of truth)
+const processedEvents = new Set();
 
 /**
- * Mirror a checkout session to Firestore `checkout_sessions` collection.
+ * Check if event has already been processed (idempotency guard)
+ * 1. Check in-memory cache first (fast)
+ * 2. Check Firestore mesomb_events collection (durable)
  *
- * @param {object} session - session object from MeSomb event
- * @param {string} status  - created | completed | expired | canceled
+ * @param {string} eventId
+ * @returns {Promise<boolean>}
  */
-async function mirrorCheckoutToFirestore(session, status) {
-  if (!db || !session) return;
+async function isAlreadyProcessed(eventId) {
+  if (!eventId) return false;
 
-  const docId = session.id || session.pk;
-  if (!docId) return;
-
-  try {
-    await db.collection("checkout_sessions").doc(docId).set(
-      { mesombPk: docId, status, payload: session, updatedAt: new Date(), source: "mesomb-webhook" },
-      { merge: true }
-    );
-    console.log(`Firestore checkout_sessions/${docId} mirrored (status=${status})`);
-  } catch (err) {
-    console.error(`Firestore mirror failed for checkout_sessions/${docId}:`, err.message);
-  }
-}
-
-/**
- * Update an order table's payment_status and payment_id in Supabase.
- *
- * @param {string} reference     - trxID / reference from MeSomb
- * @param {string|null} paymentUuid - UUID from our Supabase payments table
- * @param {string} paymentStatus - paid | failed | refunded | funded | completed
- */
-async function updateOrderPaymentStatus(reference, paymentUuid, paymentStatus) {
-  if (!supabase || !reference) return;
-
-  const resolved = resolveOrderTable(reference);
-  if (!resolved) {
-    console.log(`No order table mapped for reference "${reference}" — skipping order update`);
-    return;
+  // Fast path: check memory
+  if (processedEvents.has(eventId)) {
+    console.log(`[Webhook] Event ${eventId} found in memory cache`);
+    return true;
   }
 
-  const update = { payment_status: paymentStatus };
-  if (paymentUuid) update.payment_id = paymentUuid;
-
-  const { error } = await supabase
-    .from(resolved.table)
-    .update(update)
-    .eq("payment_reference", reference);
-
-  if (error) {
-    console.warn(`Could not update ${resolved.table} for ref ${reference}: ${error.message}`);
-  } else {
-    console.log(`Updated ${resolved.table} payment_status → ${paymentStatus} for ref ${reference}`);
-  }
-
-  // Mirror order status update to Firestore transactions collection
+  // Durable path: check Firestore
   if (db) {
     try {
-      await db.collection("transactions").doc(reference).set(
-        { paymentStatus, orderTable: resolved.table, updatedAt: new Date() },
+      const snap = await db.collection("mesomb_events").doc(eventId).get();
+      if (snap.exists) {
+        console.log(`[Webhook] Event ${eventId} found in Firestore`);
+        return true;
+      }
+    } catch (err) {
+      console.warn(`[Webhook] Firestore lookup failed (continuing): ${err.message}`);
+      // Don't fail-open — reprocessing is safe (idempotent operations in main app)
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Mark an event as processed (idempotency record)
+ * 1. Add to memory cache (bounded to 5000 entries)
+ * 2. Write to Firestore (durable record)
+ *
+ * @param {string} eventId
+ * @param {object} event - full event payload
+ * @returns {Promise<void>}
+ */
+async function markProcessed(eventId, event) {
+  if (!eventId) return;
+
+  processedEvents.add(eventId);
+  // Keep memory bounded — Firestore is the durable source of truth
+  if (processedEvents.size > 5000) {
+    console.log(`[Webhook] Memory cache full, clearing (Firestore is durable)`);
+    processedEvents.clear();
+  }
+
+  if (db) {
+    try {
+      await db.collection("mesomb_events").doc(eventId).set(
+        {
+          receivedAt: admin.firestore.Timestamp.now(),
+          forwardedTo: process.env.EATALYFT_MAIN_APP_URL || "https://eatalyft.cm",
+          eventType: event?.event_type || event?.type || null,
+          reference: event?.reference || event?.data?.object?.reference || null,
+          status: event?.status || event?.data?.object?.status || null,
+          amount: event?.amount || event?.data?.object?.amount || null,
+          raw: event,
+        },
         { merge: true }
       );
+      console.log(`[Webhook] Event ${eventId} recorded in Firestore`);
     } catch (err) {
-      console.error("Firestore order status mirror failed:", err.message);
+      console.warn(`[Webhook] Failed to persist event (continuing): ${err.message}`);
+      // Non-fatal: main app will also record this event
     }
   }
 }
 
-// ─── Main webhook endpoint ──────────────────────────────────────────────────
+/**
+ * Forward webhook event to main app
+ * The main app is the authoritative processor
+ *
+ * @param {object} options
+ * @param {string} options.url - main app webhook URL
+ * @param {Buffer|string} options.rawBody - request body
+ * @param {object} options.headers - request headers (includes signature)
+ * @param {number} [options.timeoutMs=10000] - request timeout
+ * @returns {Promise<object>} { ok: boolean, status: number, error?: string }
+ */
+async function forwardEvent({ url, rawBody, headers, timeoutMs = 10000 }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  try {
+    // Forward all headers from the original request, especially X-MeSomb-Webhook-Signature
+    const forwardHeaders = {
+      "Content-Type": "application/json",
+      "X-MeSomb-Webhook-Signature": headers["x-mesomb-webhook-signature"] || "",
+      "X-MeSomb-Webhook-Event-Id": headers["x-mesomb-webhook-event-id"] || "",
+      "X-Forwarded-By": "eatapay-microservice",
+    };
+
+    const bodyStr = rawBody instanceof Buffer ? rawBody.toString("utf8") : rawBody;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: forwardHeaders,
+      body: bodyStr,
+      signal: controller.signal,
+    });
+
+    const isSuccess = response.status >= 200 && response.status < 300;
+
+    return {
+      ok: isSuccess,
+      status: response.status,
+      error: isSuccess ? undefined : `HTTP ${response.status}`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      error: err.name === "AbortError" ? "Timeout" : err.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN WEBHOOK ENDPOINT
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /webhooks/mesomb
+ *
+ * ARCHITECTURE (Two-Webhook Design):
+ * ──────────────────────────────────────────────────────────────────────────
+ * 1. Verify X-MeSomb-Webhook-Signature (HMAC-SHA256, 5-min tolerance).
+ *    Forged or tampered events are rejected with 401 and NEVER processed.
+ *
+ * 2. Dedupe on event ID so MeSomb retries or manual replays cannot fire twice.
+ *    - Check in-memory cache (fast)
+ *    - Check Firestore mesomb_events (durable)
+ *    - Return 200 immediately if seen before
+ *
+ * 3. Forward RAW body + original signature headers to main app's
+ *    /api/webhook/mesomb — the SINGLE source of truth for:
+ *    - Wallet credit
+ *    - Mission activation
+ *    - Notifications
+ *    - Payment status updates
+ *
+ * 4. This microservice NO LONGER credits wallets or updates mission state.
+ *    All business logic lives in the main app. This design prevents double-credits.
+ *
+ * 5. Return 2xx only after main app accepts (200-299).
+ *    Otherwise return 500 so MeSomb retries.
+ *
+ * 6. Record event in Firestore ONLY after main app accepts (post-commit).
+ * ──────────────────────────────────────────────────────────────────────────
+ */
 router.post("/mesomb", async (req, res) => {
-  const rawBody         = req.body;
+  const rawBody = req.body;
   const signatureHeader = req.headers["x-mesomb-webhook-signature"] || "";
-  const eventIdHeader   = req.headers["x-mesomb-webhook-event-id"]  || "";
-  const webhookSecret   = process.env.MESOMB_WEBHOOK_SECRET || "";
-  const tolerance       = Number(process.env.WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS) || 300;
+  const eventIdHeader = req.headers["x-mesomb-webhook-event-id"] || "";
 
-  // 1. Verify signature (when secret is configured)
-  if (webhookSecret) {
-    try {
-      verifyMeSombWebhook({ rawBody, signatureHeader, webhookSecret, toleranceSeconds: tolerance });
-    } catch (err) {
-      console.warn("Webhook signature verification failed:", err.message);
-      return res.status(400).json({ error: err.message });
-    }
-  } else {
-    console.warn("MESOMB_WEBHOOK_SECRET not set — skipping signature verification (unsafe for production)");
+  console.log(`[Webhook] Received event, signature: ${signatureHeader ? "present" : "missing"}`);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 1. SIGNATURE VERIFICATION — fail closed
+  // ─────────────────────────────────────────────────────────────────────────
+  const secret = process.env.MESOMB_WEBHOOK_SECRET;
+  const toleranceSeconds = Number(process.env.WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS) || 300;
+
+  const check = verifyMeSombSignature({
+    rawBody,
+    signatureHeader,
+    secret,
+    toleranceSeconds,
+  });
+
+  if (!check.ok) {
+    console.warn(`[Webhook] ❌ Rejected event: ${check.reason}`);
+    return res.status(401).json({
+      received: false,
+      error: `Unauthorized: ${check.reason}`,
+    });
   }
 
-  // 2. Parse JSON from raw buffer
+  console.log(`[Webhook] ✅ Signature verified`);
+
+  // Parse JSON body
   let event;
   try {
     event = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    return res.status(400).json({ error: "Invalid JSON body" });
-  }
-
-  // 3. Deduplication — check Supabase webhook_events table
-  const eventId = eventIdHeader || event.id;
-  if (eventId && supabase) {
-    try {
-      const { data: existing } = await supabase
-        .from("webhook_events")
-        .select("id")
-        .eq("id", eventId)
-        .maybeSingle();
-
-      if (existing) {
-        console.log(`Duplicate webhook event ${eventId} — already processed, ignoring`);
-        return res.status(200).json({ received: true, duplicate: true });
-      }
-    } catch (err) {
-      console.error("Dedup check error:", err.message);
-    }
-  }
-
-  // 4. Acknowledge immediately
-  res.status(200).json({ received: true });
-
-  // 5. Record event in Supabase webhook_events (best-effort) + mirror to Firestore
-  if (eventId) {
-    if (supabase) {
-      supabase
-        .from("webhook_events")
-        .insert({ id: eventId, event_type: event.event_type, payload: event })
-        .then(({ error }) => { if (error) console.error("Failed to record webhook event:", error.message); });
-    }
-
-    // Firestore mirror of webhook event log
-    if (db) {
-      db.collection("webhook_events").doc(eventId).set(
-        { id: eventId, eventType: event.event_type, payload: event, processedAt: new Date() },
-        { merge: true }
-      ).catch((err) => console.error("Firestore webhook_events mirror failed:", err.message));
-    }
-  }
-
-  // 6. Route to handler
-  const handler = HANDLERS[event.event_type];
-  if (!handler) {
-    console.log(`Unrecognised event type "${event.event_type}" — acknowledged but not processed`);
-    return;
-  }
-
-  try {
-    await handler(event);
   } catch (err) {
-    console.error(`Error processing ${event.event_type} event ${eventId}:`, err);
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// EVENT HANDLERS
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ─── payment.transaction.success ───────────────────────────────────────────
-
-async function handlePaymentSuccess(event) {
-  const txn      = event.data?.object;
-  const livemode = event.livemode ?? true;
-  if (!txn) return;
-
-  console.log(`[SUCCESS] trxID=${txn.reference} pk=${txn.pk} fin_trx_id=${txn.fin_trx_id} amount=${txn.amount} ${txn.service}`);
-
-  const row = buildPaymentRow(txn, livemode);
-  let supabaseId = null;
-
-  // ── Supabase (primary) ──
-  if (supabase) {
-    const { data: upserted, error } = await supabase
-      .from("payments")
-      .upsert(row, { onConflict: "mesomb_pk" })
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("Supabase upsert failed (payment success):", error.message);
-    } else {
-      supabaseId = upserted?.id || null;
-      await updateOrderPaymentStatus(txn.reference, supabaseId, "paid");
-    }
-  }
-
-  // ── Firestore mirror (runs regardless of Supabase result) ──
-  await mirrorPaymentToFirestore(row, { supabaseId, webhookEvent: event.event_type });
-
-  // Wallet top-up in Firestore: credit the user's balance
-  if (db && txn.reference) {
-    try {
-      const docSnap = await db.collection("transactions").doc(txn.reference).get();
-      const txData  = docSnap.data();
-      if (txData?.type === "Wallet" && txData?.userId) {
-        const userRef = db.collection("users").doc(txData.userId);
-        await db.runTransaction(async (t) => {
-          const userDoc  = await t.get(userRef);
-          const balance  = userDoc.exists ? (userDoc.data()?.balance || 0) : 0;
-          t.set(userRef, { balance: balance + txn.amount }, { merge: true });
-        });
-        console.log(`Wallet topped up for user ${txData.userId}: +${txn.amount}`);
-        // Update payment mirror with wallet credit flag
-        await mirrorPaymentToFirestore(row, { supabaseId, walletCredited: true, walletUserId: txData.userId });
-      }
-    } catch (err) {
-      console.error("Firestore wallet top-up failed:", err.message);
-    }
-  }
-}
-
-// ─── payment.transaction.failed ────────────────────────────────────────────
-// A failed payment is a normal business event — handle gracefully, not as an error.
-
-async function handlePaymentFailed(event) {
-  const txn      = event.data?.object;
-  const livemode = event.livemode ?? true;
-  if (!txn) return;
-
-  console.log(`[FAILED] trxID=${txn.reference} pk=${txn.pk} reason="${txn.message}" service=${txn.service}`);
-
-  const row = buildPaymentRow(txn, livemode);
-  let supabaseId = null;
-
-  // ── Supabase (primary) ──
-  if (supabase) {
-    const { data: upserted, error } = await supabase
-      .from("payments")
-      .upsert(row, { onConflict: "mesomb_pk" })
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("Supabase upsert failed (payment failed):", error.message);
-    } else {
-      supabaseId = upserted?.id || null;
-      await updateOrderPaymentStatus(txn.reference, supabaseId, "failed");
-    }
-  }
-
-  // ── Firestore mirror (runs regardless of Supabase result) ──
-  await mirrorPaymentToFirestore(row, {
-    supabaseId,
-    webhookEvent:  event.event_type,
-    failureReason: txn.message || null,
-  });
-}
-
-// ─── checkout.session.created ──────────────────────────────────────────────
-
-async function handleCheckoutCreated(event) {
-  const session = event.data?.object;
-  if (!session) return;
-  console.log(`[CHECKOUT CREATED] id=${session.id || session.pk}`);
-
-  if (supabase) {
-    const { error } = await supabase
-      .from("checkout_sessions")
-      .upsert({ mesomb_pk: session.id || session.pk, status: "created", payload: session, updated_at: new Date().toISOString() }, { onConflict: "mesomb_pk" });
-    if (error) console.error("Supabase upsert failed (checkout created):", error.message);
-  }
-
-  await mirrorCheckoutToFirestore(session, "created");
-}
-
-// ─── checkout.session.completed ────────────────────────────────────────────
-
-async function handleCheckoutCompleted(event) {
-  const session  = event.data?.object;
-  const livemode = event.livemode ?? true;
-  if (!session) return;
-  console.log(`[CHECKOUT COMPLETED] id=${session.id || session.pk} payment_status=${session.payment_status}`);
-
-  if (supabase) {
-    const { error } = await supabase
-      .from("checkout_sessions")
-      .upsert({ mesomb_pk: session.id || session.pk, status: "completed", payload: session, updated_at: new Date().toISOString() }, { onConflict: "mesomb_pk" });
-    if (error) console.error("Supabase upsert failed (checkout completed):", error.message);
-  }
-
-  await mirrorCheckoutToFirestore(session, "completed");
-
-  // If this session carried a successful payment, trigger full fulfilment
-  if (session.payment_status === "paid" && session.payment_intent) {
-    await handlePaymentSuccess({
-      ...event,
-      event_type: MeSombEventTypes.PAYMENT_SUCCESS,
-      data: { object: session.payment_intent },
-      livemode,
+    console.error(`[Webhook] ❌ Invalid JSON body: ${err.message}`);
+    return res.status(400).json({
+      received: false,
+      error: "Invalid JSON body",
     });
   }
-}
 
-// ─── checkout.session.expired ──────────────────────────────────────────────
+  // Extract event ID (from header or body)
+  const eventId = eventIdHeader || event.id;
 
-async function handleCheckoutExpired(event) {
-  const session = event.data?.object;
-  if (!session) return;
-  console.log(`[CHECKOUT EXPIRED] id=${session.id || session.pk}`);
+  console.log(
+    `[Webhook] Event: id=${eventId}, type=${event?.event_type}, ` +
+      `ref=${event?.reference || event?.data?.object?.reference}`
+  );
 
-  if (supabase) {
-    const { error } = await supabase
-      .from("checkout_sessions")
-      .upsert({ mesomb_pk: session.id || session.pk, status: "expired", payload: session, updated_at: new Date().toISOString() }, { onConflict: "mesomb_pk" });
-    if (error) console.error("Supabase upsert failed (checkout expired):", error.message);
+  // ─────────────────────────────────────────────────────────────────────────
+  // 2. IDEMPOTENCY GUARD — skip duplicates
+  // ─────────────────────────────────────────────────────────────────────────
+  try {
+    if (await isAlreadyProcessed(eventId)) {
+      console.log(`[Webhook] ⏭️  Duplicate event ignored: ${eventId}`);
+      return res.status(200).json({
+        received: true,
+        duplicate: true,
+        message: "Event already processed",
+      });
+    }
+  } catch (err) {
+    console.warn(`[Webhook] Dedupe check failed (continuing): ${err.message}`);
+    // Continue anyway — duplication is safe (idempotent operations in main app)
   }
 
-  await mirrorCheckoutToFirestore(session, "expired");
-}
-
-// ─── checkout.session.canceled ─────────────────────────────────────────────
-
-async function handleCheckoutCanceled(event) {
-  const session = event.data?.object;
-  if (!session) return;
-  console.log(`[CHECKOUT CANCELED] id=${session.id || session.pk}`);
-
-  if (supabase) {
-    const { error } = await supabase
-      .from("checkout_sessions")
-      .upsert({ mesomb_pk: session.id || session.pk, status: "canceled", payload: session, updated_at: new Date().toISOString() }, { onConflict: "mesomb_pk" });
-    if (error) console.error("Supabase upsert failed (checkout canceled):", error.message);
+  // ─────────────────────────────────────────────────────────────────────────
+  // Check for required fields
+  // ─────────────────────────────────────────────────────────────────────────
+  const reference = event?.reference || event?.data?.object?.reference;
+  if (!reference && !event?.event_type?.includes("checkout")) {
+    console.warn(`[Webhook] ⚠️  Event has no transaction reference`);
+    return res.status(200).json({
+      received: true,
+      skipped: "no_reference",
+    });
   }
 
-  await mirrorCheckoutToFirestore(session, "canceled");
-}
+  // ─────────────────────────────────────────────────────────────────────────
+  // 3. FORWARD to main app (single source of truth)
+  // ─────────────────────────────────────────────────────────────────────────
+  const mainAppUrl = (process.env.EATALYFT_MAIN_APP_URL || "https://eatalyft.cm").replace(
+    /\/+$/,
+    ""
+  );
+  const webhookUrl = `${mainAppUrl}/api/webhook/mesomb`;
 
-// ─── securepay.transaction.funded ──────────────────────────────────────────
+  console.log(`[Webhook] 📤 Forwarding to main app: ${webhookUrl}`);
 
-async function handleSecurePayFunded(event) {
-  const txn = event.data?.object;
-  if (!txn) return;
-  console.log(`[SECUREPAY FUNDED] pk=${txn.pk} ref=${txn.reference}`);
+  const forward = await forwardEvent({
+    url: webhookUrl,
+    rawBody,
+    headers: req.headers,
+  });
 
-  const row = { ...buildPaymentRow(txn, event.livemode), status: "funded" };
-
-  if (supabase) {
-    await supabase.from("payments").upsert(row, { onConflict: "mesomb_pk" });
-    await updateOrderPaymentStatus(txn.reference, null, "funded");
-  }
-  await mirrorPaymentToFirestore(row, { webhookEvent: event.event_type });
-}
-
-// ─── securepay.transaction.released ───────────────────────────────────────
-
-async function handleSecurePayReleased(event) {
-  const txn = event.data?.object;
-  if (!txn) return;
-  console.log(`[SECUREPAY RELEASED] pk=${txn.pk} ref=${txn.reference}`);
-
-  const row = { ...buildPaymentRow(txn, event.livemode), status: "SUCCESS" };
-
-  if (supabase) {
-    await supabase.from("payments").upsert(row, { onConflict: "mesomb_pk" });
-    await updateOrderPaymentStatus(txn.reference, null, "completed");
-  }
-  await mirrorPaymentToFirestore(row, { webhookEvent: event.event_type });
-}
-
-// ─── securepay.transaction.refunded ───────────────────────────────────────
-
-async function handleSecurePayRefunded(event) {
-  const txn = event.data?.object;
-  if (!txn) return;
-  console.log(`[SECUREPAY REFUNDED] pk=${txn.pk} ref=${txn.reference}`);
-
-  const row = { ...buildPaymentRow(txn, event.livemode), status: "REFUNDED" };
-
-  if (supabase) {
-    await supabase.from("payments").upsert(row, { onConflict: "mesomb_pk" });
-    await updateOrderPaymentStatus(txn.reference, null, "refunded");
-  }
-  await mirrorPaymentToFirestore(row, { webhookEvent: event.event_type });
-}
-
-// ─── securepay.transaction.disputed ───────────────────────────────────────
-
-async function handleSecurePayDisputed(event) {
-  const txn = event.data?.object;
-  if (!txn) return;
-  console.log(`[SECUREPAY DISPUTED] pk=${txn.pk} ref=${txn.reference}`);
-
-  const row = { ...buildPaymentRow(txn, event.livemode), status: "disputed" };
-
-  if (supabase) {
-    await supabase.from("payments").upsert(row, { onConflict: "mesomb_pk" });
-  }
-  await mirrorPaymentToFirestore(row, { webhookEvent: event.event_type });
-}
-
-// ─── Generic securepay status update handler ──────────────────────────────
-
-async function handleSecurePayGeneric(event, status) {
-  const txn = event.data?.object;
-  if (!txn) return;
-
-  const row = { ...buildPaymentRow(txn, event.livemode), status };
-
-  if (supabase) {
-    await supabase.from("payments").upsert(row, { onConflict: "mesomb_pk" });
-  }
-  await mirrorPaymentToFirestore(row, { webhookEvent: event.event_type });
-}
-
-// ─── Dispute sub-event handlers ────────────────────────────────────────────
-
-async function handleDisputeEvent(event) {
-  const dispute = event.data?.object;
-  if (!dispute) return;
-  console.log(`[DISPUTE ${event.event_type}] id=${dispute.id || dispute.pk}`);
-
-  if (supabase) {
-    const { error } = await supabase
-      .from("webhook_events")
-      .upsert({ id: `dispute-${event.id}`, event_type: event.event_type, payload: event }, { onConflict: "id" });
-    if (error) console.error("Failed to store dispute event:", error.message);
+  if (!forward.ok) {
+    console.error(
+      `[Webhook] ❌ Forward FAILED (status ${forward.status || "unknown"}): ${forward.error}`
+    );
+    // Return 500 so MeSomb retries
+    return res.status(500).json({
+      received: false,
+      error: "Main app webhook unreachable — will retry",
+    });
   }
 
-  // Firestore mirror of dispute event
-  if (db) {
-    const docId = `dispute-${event.id || dispute.id || dispute.pk}`;
-    db.collection("disputes").doc(docId).set(
-      { eventType: event.event_type, payload: event, updatedAt: new Date() },
-      { merge: true }
-    ).catch((err) => console.error("Firestore dispute mirror failed:", err.message));
+  console.log(`[Webhook] ✅ Main app accepted event (${forward.status})`);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 4. RECORD EVENT — only after main app accepted
+  // ─────────────────────────────────────────────────────────────────────────
+  try {
+    await markProcessed(eventId, event);
+  } catch (err) {
+    console.warn(`[Webhook] Failed to mark event processed (continuing): ${err.message}`);
   }
-}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HANDLER ROUTING MAP
-// ═══════════════════════════════════════════════════════════════════════════
+  console.log(`[Webhook] ✅ Event ${eventId} complete`);
+  return res.status(200).json({
+    received: true,
+    forwarded: true,
+    message: "Event processed via main app",
+  });
+});
 
-const HANDLERS = {
-  [MeSombEventTypes.PAYMENT_SUCCESS]: handlePaymentSuccess,
-  [MeSombEventTypes.PAYMENT_FAILED]:  handlePaymentFailed,
-
-  [MeSombEventTypes.CHECKOUT_CREATED]:   handleCheckoutCreated,
-  [MeSombEventTypes.CHECKOUT_COMPLETED]: handleCheckoutCompleted,
-  [MeSombEventTypes.CHECKOUT_EXPIRED]:   handleCheckoutExpired,
-  [MeSombEventTypes.CHECKOUT_CANCELED]:  handleCheckoutCanceled,
-
-  [MeSombEventTypes.SECUREPAY_FUNDED]:   handleSecurePayFunded,
-  [MeSombEventTypes.SECUREPAY_RELEASED]: handleSecurePayReleased,
-  [MeSombEventTypes.SECUREPAY_REFUNDED]: handleSecurePayRefunded,
-  [MeSombEventTypes.SECUREPAY_DISPUTED]: handleSecurePayDisputed,
-
-  [MeSombEventTypes.SECUREPAY_CREATED]:             (e) => handleSecurePayGeneric(e, "created"),
-  [MeSombEventTypes.SECUREPAY_CANCELLED]:           (e) => handleSecurePayGeneric(e, "cancelled"),
-  [MeSombEventTypes.SECUREPAY_EXPIRED]:             (e) => handleSecurePayGeneric(e, "expired"),
-  [MeSombEventTypes.SECUREPAY_AWAITING_RELEASE]:    (e) => handleSecurePayGeneric(e, "awaiting_release"),
-  [MeSombEventTypes.SECUREPAY_FULFILLMENT_UPDATED]: (e) => handleSecurePayGeneric(e, "fulfillment_updated"),
-
-  [MeSombEventTypes.DISPUTE_EVIDENCE_ADDED]: handleDisputeEvent,
-  [MeSombEventTypes.DISPUTE_MESSAGE_ADDED]:  handleDisputeEvent,
-  [MeSombEventTypes.DISPUTE_UNDER_REVIEW]:   handleDisputeEvent,
-  [MeSombEventTypes.DISPUTE_RESOLVED]:       handleDisputeEvent,
-};
 
 export default router;
