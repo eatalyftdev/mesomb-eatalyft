@@ -40,7 +40,7 @@
  */
 
 import express from "express";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { db, admin } from "../config/firebase.js";
 
 const router = express.Router();
@@ -329,7 +329,11 @@ router.post("/mesomb", async (req, res) => {
   }
 
   // Extract event ID (from header or body)
-  const eventId = eventIdHeader || event.id;
+  const eventId =
+    eventIdHeader ||
+    event.id ||
+    event.data?.id ||
+    createHash("sha256").update(rawBody).digest("hex");
 
   console.log(
     `[Webhook] Event: id=${eventId}, type=${event?.event_type}, ` +

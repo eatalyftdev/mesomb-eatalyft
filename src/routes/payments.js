@@ -32,21 +32,38 @@ router.post("/collect", async (req, res) => {
   try {
     const { phone, amount, service, type, userId, trxID: bodyTrxID, mode, customer } = req.body;
 
-    if (!phone || !amount || !service || !type) {
+    if (!phone || !service || !type || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: phone, amount, service, type",
+        error: "Required fields: phone, service, type, and a positive numeric amount",
       });
     }
 
     // trxID becomes the `reference` in all MeSomb webhook events — use your order ID here
     const trxID = bodyTrxID || `EATALYFT-${type.toUpperCase()}-${Date.now()}`;
+    const numericAmount = Number(amount);
+
+    // Persist before the provider call so a fast webhook always finds a record.
+    if (db) {
+      await db.collection("transactions").doc(trxID).set({
+        userId: userId || null,
+        phone,
+        amount: numericAmount,
+        type,
+        serviceType: type,
+        service,
+        status: "processing",
+        trxID,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }, { merge: true });
+    }
 
     const { response, paymentId, opSuccess, txnSuccess } = await collectPayment({
-      phone,
-      amount,
-      service,
-      type,
+          phone,
+          amount: numericAmount,
+          service,
+          type,
       trxID,
       userId,
       mode: mode || "asynchronous",
@@ -56,16 +73,17 @@ router.post("/collect", async (req, res) => {
     // Optionally log to Firestore as well (for apps still using Firebase)
     if (db) {
       await db.collection("transactions").doc(trxID).set({
-        userId:             userId || null,
+        userId: userId || null,
         phone,
-        amount,
+        amount: numericAmount,
         type,
+        serviceType: type,
         service,
-        status:             response.transaction?.status || "PENDING",
+        status: response.transaction?.status || "PENDING",
         trxID,
-        mesombTransactionId: response.transaction?.pk   || null,
-        createdAt:          new Date(),
-      });
+        mesombTransactionId: response.transaction?.pk || null,
+        updatedAt: new Date(),
+      }, { merge: true });
     }
 
     return res.json({
