@@ -139,6 +139,14 @@ END $$;
 ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.webhook_events ENABLE ROW LEVEL SECURITY;
 
+-- Realtime clients may read only their own payment mirror when the Supabase
+-- Auth UID is the same identifier used as the Firestore userId.
+DROP POLICY IF EXISTS payments_select_own ON public.payments;
+CREATE POLICY payments_select_own
+  ON public.payments
+  FOR SELECT TO authenticated
+  USING (auth.uid()::TEXT = user_id);
+
 -- Supabase Realtime publishes committed row changes to authorized clients.
 ALTER TABLE public.payments REPLICA IDENTITY FULL;
 ALTER TABLE public.webhook_events REPLICA IDENTITY FULL;
