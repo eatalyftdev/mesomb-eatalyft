@@ -24,13 +24,6 @@ CREATE TABLE IF NOT EXISTS public.webhook_events (
   processing_error TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_webhook_events_reference
-  ON public.webhook_events(reference);
-CREATE INDEX IF NOT EXISTS idx_webhook_events_received_at
-  ON public.webhook_events(received_at DESC);
-CREATE INDEX IF NOT EXISTS idx_webhook_events_status
-  ON public.webhook_events(status);
-
 CREATE TABLE IF NOT EXISTS public.payments (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   firebase_ref  TEXT,
@@ -112,12 +105,19 @@ ALTER TABLE public.webhook_events
   ADD COLUMN IF NOT EXISTS forwarded_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS processing_error TEXT;
 
+-- These indexes must follow the compatibility ALTER TABLE statements above.
+CREATE INDEX IF NOT EXISTS idx_webhook_events_reference
+  ON public.webhook_events(reference);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_received_at
+  ON public.webhook_events(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_status
+  ON public.webhook_events(status);
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_firebase_ref
   ON public.payments(firebase_ref)
   WHERE firebase_ref IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_reference
-  ON public.payments(reference)
-  WHERE reference IS NOT NULL;
+-- `reference` already exists in the legacy payments schema, but it is not
+-- unique across all provider attempts. The sync uses firebase_ref instead.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_mesomb_pk
   ON public.payments(mesomb_pk)
   WHERE mesomb_pk IS NOT NULL;
