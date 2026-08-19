@@ -6,7 +6,7 @@
   "scripts": {
     "build": "echo Build complete",
     "start": "node src/index.js",
-    "test": "node --test src/__tests__/webhook.test.js"
+    "test": "node --test src/__tests__/*.test.js"
   },
   "dependencies": {
     "@hachther/mesomb": "^2.0.0",
