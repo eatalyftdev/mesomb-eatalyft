@@ -3,6 +3,10 @@
   "version": "2.0.0",
   "type": "module",
   "main": "src/index.js",
+  "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "build": "echo Build complete",
     "start": "node src/index.js",

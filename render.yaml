@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: mesomb-eatalyft
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22.22.0"
+      - key: PORT
+        value: "10000"
+      - key: MESOMB_APPLICATION_KEY
+        sync: false
+      - key: MESOMB_ACCESS_KEY
+        sync: false
+      - key: MESOMB_SECRET_KEY
+        sync: false
+      - key: MESOMB_WEBHOOK_SECRET
+        sync: false
+      - key: MESOMB_API_VERSION
+        sync: false
+      - key: MESOMB_LIVEMODE
+        sync: false
+      - key: WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
