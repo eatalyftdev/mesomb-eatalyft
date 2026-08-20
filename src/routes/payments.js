@@ -9,6 +9,7 @@ import {
 } from "../services/mesombService.js";
 import { db } from "../config/firebase.js";
 import { requireInternalServiceKey } from "../middleware/internalServiceAuth.js";
+import { requireServiceKey } from "../middleware/serviceKeyAuth.js";
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ const router = express.Router();
  *   mode        {string}  - (optional) 'asynchronous' (default) | 'synchronous'
  *   customer    {object}  - (optional) { firstName, lastName, email, town, region, country }
  */
-router.post("/collect", requireInternalServiceKey, async (req, res) => {
+router.post("/collect", requireInternalServiceKey, requireServiceKey, async (req, res) => {
   try {
     const { phone, amount, service, type, userId, trxID: bodyTrxID, mode, customer } = req.body;
 
@@ -114,7 +115,7 @@ router.post("/collect", requireInternalServiceKey, async (req, res) => {
  *   userId   {string}  - (optional) Your internal user ID
  *   trxID    {string}  - (optional) Your payout reference ID
  */
-router.post("/deposit", requireInternalServiceKey, async (req, res) => {
+router.post("/deposit", requireInternalServiceKey, requireServiceKey, async (req, res) => {
   try {
     const { phone, amount, service, userId, trxID: bodyTrxID } = req.body;
 
@@ -172,7 +173,7 @@ router.post("/deposit", requireInternalServiceKey, async (req, res) => {
  *   transactionId  {string}  - The MeSomb transaction pk to refund
  *   amount         {number}  - (optional) Partial refund amount; omit for full refund
  */
-router.post("/refund", requireInternalServiceKey, async (req, res) => {
+router.post("/refund", requireInternalServiceKey, requireServiceKey, async (req, res) => {
   try {
     const { transactionId, amount } = req.body;
 
