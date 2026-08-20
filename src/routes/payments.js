@@ -233,20 +233,54 @@ router.get("/transactions", async (req, res) => {
  *
  * Check / validate transactions by their IDs.
  */
-router.get("/transactions/check", async (req, res) => {
+router.get("/transactions/check/:reference", requireInternalServiceKey, requireServiceKey, async (req, res) => {
   try {
-    const { ids, source } = req.query;
+    const reference = String(req.params.reference || '').trim();
+    if (!reference) {
+      return res.status(400).json({ success: false, error: "Missing transaction reference" });
+    }
+
+    const transactions = await getTransactions([reference], "EXTERNAL");
+    const transaction = transactions?.[0] || null;
+    return res.json({
+      success: true,
+      reference,
+      transaction,
+      status: transaction?.status || "PENDING",
+      transactions,
+    });
+  } catch (error) {
+    console.error("Check transaction by reference error:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get("/transactions/check", requireInternalServiceKey, requireServiceKey, async (req, res) => {
+  try {
+    const { ids, reference, source } = req.query;
+    const requestedReference = String(reference || '').trim();
+
+    if (requestedReference) {
+      const transactions = await getTransactions([requestedReference], source || "EXTERNAL");
+      const transaction = transactions?.[0] || null;
+      return res.json({
+        success: true,
+        reference: requestedReference,
+        transaction,
+        status: transaction?.status || "PENDING",
+        transactions,
+      });
+    }
 
     if (!ids) {
       return res.status(400).json({
         success: false,
-        error: "Missing required query param: ids (comma-separated)",
+        error: "Missing required query param: reference or ids (comma-separated)",
       });
     }
 
-    const idList       = ids.split(",").map((id) => id.trim()).filter(Boolean);
+    const idList = String(ids).split(",").map((id) => id.trim()).filter(Boolean);
     const transactions = await checkTransactions(idList, source || "MESOMB");
-
     return res.json({ success: true, transactions });
   } catch (error) {
     console.error("Check transactions error:", error);
